@@ -1,0 +1,17 @@
+streamlit
+pdf2image
+easyocr
+pillow
+pandas
+opencv-python-headless
+numpy
+torch
+torchvision
+transformers
+streamlit
+pdftext
+streamlit
+pandas
+azure-ai-documentintelligence
+azure-core
+python-dotenv
