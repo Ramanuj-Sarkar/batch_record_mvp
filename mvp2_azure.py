@@ -2,6 +2,7 @@ import json
 import os
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import streamlit as st
@@ -104,6 +105,21 @@ def recover_cell_text_from_words(cell: dict, pages: list[dict]) -> str:
     return " ".join(w for w in recovered_words if w).strip()
 
 
+def convert_table_to_events(rows, page_number=0):
+    events = []
+
+    for r in rows:
+        events.append({
+            "event_type": "process_log",
+            "time": r.get("Time"),
+            "temperature": r.get("Temp"),
+            "operator": r.get("Operator"),
+            "page": page_number
+        })
+
+    return events
+
+
 def parse_azure_table(t: dict, pages: list[dict]) -> list[dict]:
     """
     Convert one Azure table object into a list of row dictionaries.
@@ -141,20 +157,38 @@ def parse_all_azure_tables(rr: dict) -> list[dict]:
     """
     Parse all Azure tables into structured row-based output.
     """
-    parsed_tables = []
+    parsed_t = []
     pages = rr.get("pages", [])
 
     for idx, t in enumerate(rr.get("tables", []), start=1):
         parsed_rows = parse_azure_table(t, pages)
 
-        parsed_tables.append({
+        parsed_t.append({
             "table_index": idx,
             "row_count": t.get("row_count"),
             "column_count": t.get("column_count"),
             "rows": parsed_rows,
         })
 
-    return parsed_tables
+        if 'Temp' in parsed_rows[0]:
+            events = convert_table_to_events(parsed_rows)
+            for event in events:
+                parsed_t.append(event)
+
+    return parsed_t
+
+
+def classify_page(text):
+    if "batch number" in text.lower():
+        return "header_page"
+
+    if "material" in text.lower():
+        return "material_page"
+
+    if "time" in text.lower() and "temperature" in text.lower():
+        return "process_log_page"
+
+    return "unknown_page"
 
 
 def normalize_prebuilt_result(result: dict) -> dict:
@@ -174,6 +208,7 @@ def normalize_prebuilt_result(result: dict) -> dict:
     for page in result.get("pages", []):
         page_number = page["page_number"]
         page_text = "\n".join(line["content"] for line in page.get("lines", []))
+        page_type = classify_page(page_text)
 
         batch_number = extract_with_patterns(
             page_text,
@@ -219,7 +254,7 @@ def normalize_prebuilt_result(result: dict) -> dict:
         normalized["pages"].append(
             {
                 "page_number": page_number,
-                "page_type": "unknown_page",
+                "page_type": page_type,
                 "ocr_text": page_text,
                 "fields": {
                     "batch_number": batch_number,
@@ -248,7 +283,7 @@ def normalize_prebuilt_result(result: dict) -> dict:
 
     return normalized
 
-'''
+
 def normalize_custom_result(result: dict) -> dict:
     """
     Normalize Azure custom model output into the same simple schema.
@@ -307,7 +342,6 @@ def normalize_custom_result(result: dict) -> dict:
         )
 
     return normalized
-'''
 
 
 def build_summary_dataframe(normalized: dict) -> pd.DataFrame:
@@ -343,7 +377,6 @@ pages_to_process = st.text_input(
     placeholder="Example: 1-3 or 1,3,5",
 )
 
-'''
 default_custom_model_id = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_CUSTOM_MODEL_ID", "")
 custom_model_id = ""
 
@@ -352,7 +385,6 @@ if model_choice == "custom-model":
         "Custom model ID",
         value=default_custom_model_id,
     )
-'''
 
 if uploaded_file is not None:
     pdf_bytes = uploaded_file.read()
@@ -373,7 +405,6 @@ if uploaded_file is not None:
                         pages=pages_to_process or None,
                     )
                     normalized_result = normalize_prebuilt_result(raw_result)
-                '''
                 else:
                     raw_result = azure_extractor.analyze_custom(
                         pdf_bytes,
@@ -381,7 +412,6 @@ if uploaded_file is not None:
                         pages=pages_to_process or None,
                     )
                     normalized_result = normalize_custom_result(raw_result)
-                '''
 
                 parsed_tables = []
                 if model_choice == "prebuilt-layout":
@@ -408,24 +438,32 @@ if uploaded_file is not None:
                 df = build_summary_dataframe(normalized_result)
                 st.dataframe(df, width='stretch')
 
-                normalized_json = json.dumps(normalized_result, indent=2)
+                output_package = {
+                    "normalized_result": normalized_result,
+                    "parsed_tables": parsed_tables,
+                }
+
+                normalized_json = json.dumps(output_package, indent=2)
                 raw_json = json.dumps(raw_result, indent=2)
 
                 if parsed_tables:
                     st.subheader("Parsed Azure Tables")
 
                     for table in parsed_tables:
-                        st.write(
-                            f"Table {table['table_index']} "
-                            f"({table['row_count']} rows x {table['column_count']} columns)"
-                        )
+                        if 'event_type' in table:
+                            continue
+                        elif 'table_index' in table:
+                            st.write(
+                                f"Table {table['table_index']} "
+                                f"({table['row_count']} rows x {table['column_count']} columns)"
+                            )
 
-                        table_rows = table["rows"]
-                        if table_rows:
-                            table_df = pd.DataFrame(table_rows)
-                            st.dataframe(table_df, width='stretch')
-                        else:
-                            st.info("No parsed rows found for this table.")
+                            table_rows = table["rows"]
+                            if table_rows:
+                                table_df = pd.DataFrame(table_rows)
+                                st.dataframe(table_df, width='stretch')
+                            else:
+                                st.info("No parsed rows found for this table.")
 
                 st.download_button(
                     label="Download Normalized JSON",
