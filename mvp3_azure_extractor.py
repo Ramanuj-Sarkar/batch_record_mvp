@@ -141,14 +141,17 @@ class AzureDocIntExtractor:
                             getattr(table, "bounding_regions", None)
                         ),
                         "cells": [
-                            {
-                                "row_index": int(cell.row_index),
-                                "column_index": int(cell.column_index),
-                                "content": cell.content,
-                                "kind": getattr(cell, "kind", None),
-                            }
-                            for cell in table.cells
-                        ],
+                                    {
+                                        "row_index": int(cell.row_index),
+                                        "column_index": int(cell.column_index),
+                                        "content": cell.content,
+                                        "kind": getattr(cell, "kind", None),
+                                        "bounding_regions": self._normalize_bounding_regions(
+                                            getattr(cell, "bounding_regions", None)
+                                        ),
+                                    }
+                                    for cell in table.cells
+                                ],
                     }
                 )
 

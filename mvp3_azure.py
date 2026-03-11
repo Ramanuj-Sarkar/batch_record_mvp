@@ -33,6 +33,130 @@ def extract_with_patterns(text: str, patterns: list[str]):
     return None
 
 
+def polygon_to_bbox(polygon):
+    """
+    Convert Azure polygon [x1,y1,x2,y2,x3,y3,x4,y4] to bounding box.
+    """
+    if not polygon or len(polygon) < 8:
+        return None
+
+    xs = polygon[0::2]
+    ys = polygon[1::2]
+
+    return {
+        "x_min": min(xs),
+        "y_min": min(ys),
+        "x_max": max(xs),
+        "y_max": max(ys),
+    }
+
+
+def word_center_in_bbox(word_polygon, cell_bbox):
+    """
+    Check whether the center of a word polygon lies inside a cell bbox.
+    """
+    if not word_polygon or not cell_bbox:
+        return False
+
+    xs = word_polygon[0::2]
+    ys = word_polygon[1::2]
+
+    x_center = sum(xs) / len(xs)
+    y_center = sum(ys) / len(ys)
+
+    return (
+        cell_bbox["x_min"] <= x_center <= cell_bbox["x_max"]
+        and cell_bbox["y_min"] <= y_center <= cell_bbox["y_max"]
+    )
+
+
+def recover_cell_text_from_words(cell: dict, pages: list[dict]) -> str:
+    """
+    Recover cell text by finding page words whose centers fall inside the cell polygon.
+    """
+    bounding_regions = cell.get("bounding_regions", [])
+    if not bounding_regions:
+        return ""
+
+    recovered_words = []
+
+    for region in bounding_regions:
+        page_number = region.get("page_number")
+        polygon = region.get("polygon")
+        cell_bbox = polygon_to_bbox(polygon)
+
+        if not cell_bbox:
+            continue
+
+        matching_page = next(
+            (p for p in pages if p.get("page_number") == page_number),
+            None
+        )
+
+        if not matching_page:
+            continue
+
+        for word in matching_page.get("words", []):
+            word_polygon = word.get("polygon")
+            if word_center_in_bbox(word_polygon, cell_bbox):
+                recovered_words.append(word.get("content", ""))
+
+    return " ".join(w for w in recovered_words if w).strip()
+
+
+def parse_azure_table(t: dict, pages: list[dict]) -> list[dict]:
+    """
+    Convert one Azure table object into a list of row dictionaries.
+
+    Uses cell.content first.
+    If cell.content is empty, tries to recover text from page words
+    inside the cell bounding box.
+    Assumes row 0 contains headers.
+    """
+    headers = {}
+    rows = {}
+
+    for cell in t.get("cells", []):
+        r = cell["row_index"]
+        c = cell["column_index"]
+
+        text = (cell.get("content") or "").strip()
+
+        if not text:
+            text = recover_cell_text_from_words(cell, pages)
+
+        if r == 0:
+            headers[c] = text if text else f"col_{c}"
+        else:
+            if r not in rows:
+                rows[r] = {}
+
+            column_name = headers.get(c, f"col_{c}")
+            rows[r][column_name] = text
+
+    return list(rows.values())
+
+
+def parse_all_azure_tables(rr: dict) -> list[dict]:
+    """
+    Parse all Azure tables into structured row-based output.
+    """
+    parsed_tables = []
+    pages = rr.get("pages", [])
+
+    for idx, t in enumerate(rr.get("tables", []), start=1):
+        parsed_rows = parse_azure_table(t, pages)
+
+        parsed_tables.append({
+            "table_index": idx,
+            "row_count": t.get("row_count"),
+            "column_count": t.get("column_count"),
+            "rows": parsed_rows,
+        })
+
+    return parsed_tables
+
+
 def normalize_prebuilt_result(result: dict) -> dict:
     """
     Normalize Azure prebuilt-read or prebuilt-layout output into a simple schema.
@@ -56,6 +180,7 @@ def normalize_prebuilt_result(result: dict) -> dict:
             [
                 r"Batch\s*Number[:\-]?\s*([A-Za-z0-9\-\/]+)",
                 r"Batch\s*No[:\-]?\s*([A-Za-z0-9\-\/]+)",
+                r"BMR\s*No\s*.:\s*([A-Za-z0-9\-\/]+)"
             ],
         )
 
@@ -208,7 +333,7 @@ uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
 model_choice = st.selectbox(
     "Choose Azure model",
-    ["prebuilt-read", "prebuilt-layout", "custom-model"],
+    ["prebuilt-layout", "prebuilt-read", "custom-model"],
 )
 
 pages_to_process = st.text_input(
@@ -253,17 +378,21 @@ if uploaded_file is not None:
                     )
                     normalized_result = normalize_custom_result(raw_result)
 
+                parsed_tables = []
+                if model_choice == "prebuilt-layout":
+                    parsed_tables = parse_all_azure_tables(raw_result)
+
                 st.success("Document processed successfully.")
 
                 col1, col2 = st.columns(2)
 
                 with col1:
-                    st.subheader("Normalized Batch Record Output")
-                    st.json(normalized_result)
+                    with st.expander("Show Normalized Batch Record Output"):
+                        st.json(normalized_result)
 
                 with col2:
-                    st.subheader("Raw Azure Output")
-                    st.json(raw_result)
+                    with st.expander("Show Raw Azure Output"):
+                        st.json(raw_result)
 
                 if normalized_result.get("validation_warnings"):
                     st.subheader("Validation Warnings")
@@ -276,6 +405,22 @@ if uploaded_file is not None:
 
                 normalized_json = json.dumps(normalized_result, indent=2)
                 raw_json = json.dumps(raw_result, indent=2)
+
+                if parsed_tables:
+                    st.subheader("Parsed Azure Tables")
+
+                    for table in parsed_tables:
+                        st.write(
+                            f"Table {table['table_index']} "
+                            f"({table['row_count']} rows x {table['column_count']} columns)"
+                        )
+
+                        table_rows = table["rows"]
+                        if table_rows:
+                            table_df = pd.DataFrame(table_rows)
+                            st.dataframe(table_df, use_container_width=True)
+                        else:
+                            st.info("No parsed rows found for this table.")
 
                 st.download_button(
                     label="Download Normalized JSON",
