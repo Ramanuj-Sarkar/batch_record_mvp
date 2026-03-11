@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from mvp3_azure_extractor import AzureDocIntExtractor
+from mvp_azure_extractor import AzureDocIntExtractor
 
 load_dotenv()
 
@@ -179,6 +179,7 @@ def normalize_prebuilt_result(result: dict) -> dict:
             page_text,
             [
                 r"Batch\s*Number[:\-]?\s*([A-Za-z0-9\-\/]+)",
+                r"Batch\s*Record\s*:\n*\s*([A-Za-z0-9\-\/]+)"
                 r"Batch\s*No[:\-]?\s*([A-Za-z0-9\-\/]+)",
                 r"BMR\s*No\s*.:\s*([A-Za-z0-9\-\/]+)"
             ],
