@@ -32,10 +32,9 @@ class DonutExtractor:
     """
     Wrapper around Donut model for structured document extraction.
     """
-
     def __init__(
         self,
-        model_name: str = "naver-clova-ix/donut-base-finetuned-docvqa",
+        model_name: str = "naver-clova-ix/donut-base-finetuned-cord-v2",
         device: str | None = None,
     ):
         """
@@ -48,18 +47,20 @@ class DonutExtractor:
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        print(f"Loading Donut model on {self.device}")
-
         self.processor = DonutProcessor.from_pretrained(model_name)
         self.model = VisionEncoderDecoderModel.from_pretrained(model_name)
 
         self.model.to(self.device)
         self.model.eval()
 
+        self.task_prompt = "<s_cord-v2>"
+
     def preprocess_image(self, image: Image.Image):
         """
         Convert PIL image to model input tensor.
         """
+        if image.mode != "RGB":
+            image = image.convert("RGB")
 
         pixel_values = self.processor(image, return_tensors="pt").pixel_values
         return pixel_values.to(self.device)
@@ -69,43 +70,53 @@ class DonutExtractor:
         Run model inference.
         """
 
-        task_prompt = "<s_docvqa>"  # default prompt for pretrained model
-
         decoder_input_ids = self.processor.tokenizer(
-            task_prompt,
+            self.task_prompt,
             add_special_tokens=False,
             return_tensors="pt",
         ).input_ids.to(self.device)
 
-        outputs = self.model.generate(
-            pixel_values,
-            decoder_input_ids=decoder_input_ids,
-            max_length=512,
-            early_stopping=True,
-            pad_token_id=self.processor.tokenizer.pad_token_id,
-            eos_token_id=self.processor.tokenizer.eos_token_id,
-        )
+        with torch.no_grad():
+            outputs = self.model.generate(
+                pixel_values,
+                decoder_input_ids=decoder_input_ids,
+                max_length=self.model.decoder.config.max_position_embeddings,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+                use_cache=True,
+                bad_words_ids=[[self.processor.tokenizer.unk_token_id]],
+                return_dict_in_generate=True,
+            )
 
-        sequence = self.processor.batch_decode(outputs)[0]
+        sequence = self.processor.batch_decode(outputs.sequences)[0]
+        sequence = sequence.replace(self.processor.tokenizer.eos_token, "")
+        sequence = sequence.replace(self.processor.tokenizer.pad_token, "")
+        sequence = re.sub(r"<.*?>", "", sequence, count=1).strip()
+
         return sequence
 
     def parse_output(self, model_output: str):
         """
         Convert model output string into JSON dictionary.
         """
+        try:
+            if hasattr(self.processor, "token2json"):
+                return self.processor.token2json(model_output)
+        except Exception:
+            pass
 
         try:
             start = model_output.find("{")
             end = model_output.rfind("}") + 1
-
-            json_string = model_output[start:end]
-            return json.loads(json_string)
-
+            if start != -1 and end > start:
+                return json.loads(model_output[start:end])
         except Exception:
-            return {
-                "raw_output": model_output,
-                "parse_error": True
-            }
+            pass
+
+        return {
+            "raw_output": model_output,
+            "parse_error": True
+        }
 
     def extract(self, image: Image.Image):
         """
