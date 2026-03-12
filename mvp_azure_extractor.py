@@ -1,3 +1,7 @@
+"""
+Extracts data from Azure Document Intelligence
+to feed into MVP 1.
+"""
 import os
 from typing import Any
 

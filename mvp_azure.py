@@ -1,3 +1,13 @@
+"""
+MVP 1: Batch Record Extraction with Table and Handwriting Comprehension
+
+This version extends the EasyOCR version by using Azure Document Intelligence
+to improve extraction from form-style biopharma batch record pages
+where table and handwriting comprehension are important.
+
+Goal:
+Improve performance on tables and handwriting from previous OCR MVP.
+"""
 import json
 import os
 import re

@@ -1,8 +1,20 @@
+"""
+MVP 2: Batch Record Extraction with Confidence
+
+This version improves upon the previous MVP by adding
+confidence data which focuses on possible issues,
+methods to fill in data missing from specific pages,
+and a different format for tables which incorporates data better.
+
+Goal:
+Enhance previous MVP by adding confidence data
+and ability to incorporate AI tools when appropriate.
+"""
 import json
 import os
 import re
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor  # implement threading
 
 import pandas as pd
 import streamlit as st
