@@ -10,6 +10,10 @@ from dotenv import load_dotenv
 
 from mvp2_azure_extractor import AzureDocIntExtractor
 
+WORD_CONFIDENCE_THRESHOLD = 0.75
+FIELD_CONFIDENCE_THRESHOLD = 0.75
+MAX_LOW_CONFIDENCE_WORDS_TO_SHOW = 15
+
 load_dotenv()
 
 st.set_page_config(page_title="Azure Batch Record Extraction MVP", layout="wide")
@@ -34,7 +38,7 @@ def extract_with_patterns(text: str, patterns: list[str]):
     return None
 
 
-def polygon_to_bbox(polygon):
+def polygon_to_bbox(polygon: list) -> dict | None:
     """
     Convert Azure polygon [x1,y1,x2,y2,x3,y3,x4,y4] to bounding box.
     """
@@ -52,7 +56,7 @@ def polygon_to_bbox(polygon):
     }
 
 
-def word_center_in_bbox(word_polygon, cell_bbox):
+def word_center_in_bbox(word_polygon, cell_bbox) -> bool:
     """
     Check whether the center of a word polygon lies inside a cell bbox.
     """
@@ -82,7 +86,7 @@ def recover_cell_text_from_words(cell: dict, pages: list[dict]) -> str:
     recovered_words = []
 
     for region in bounding_regions:
-        page_number = region.get("page_number")
+        pagenum = region.get("page_number")
         polygon = region.get("polygon")
         cell_bbox = polygon_to_bbox(polygon)
 
@@ -90,7 +94,7 @@ def recover_cell_text_from_words(cell: dict, pages: list[dict]) -> str:
             continue
 
         matching_page = next(
-            (p for p in pages if p.get("page_number") == page_number),
+            (p for p in pages if p.get("page_number") == pagenum),
             None
         )
 
@@ -105,7 +109,7 @@ def recover_cell_text_from_words(cell: dict, pages: list[dict]) -> str:
     return " ".join(w for w in recovered_words if w).strip()
 
 
-def convert_table_to_events(rows, page_number=0):
+def convert_table_to_events(rows: list[dict], pagenum: int = 0) -> list[dict]:
     events = []
 
     for r in rows:
@@ -114,7 +118,7 @@ def convert_table_to_events(rows, page_number=0):
             "time": r.get("Time"),
             "temperature": r.get("Temp"),
             "operator": r.get("Operator"),
-            "page": page_number
+            "page": pagenum
         })
 
     return events
@@ -178,7 +182,7 @@ def parse_all_azure_tables(rr: dict) -> list[dict]:
     return parsed_t
 
 
-def classify_page(text):
+def classify_page(text: str) -> str:
     if "batch number" in text.lower():
         return "header_page"
 
@@ -189,6 +193,96 @@ def classify_page(text):
         return "process_log_page"
 
     return "unknown_page"
+
+
+def extract_handwritten_spans(rr: dict) -> list[dict]:
+    handwritten = []
+
+    full_content = rr.get("content", "")
+    styles = rr.get("styles", [])
+
+    for style in styles:
+        if style.get("is_handwritten") is True:
+            for span in style.get("spans", []):
+                offset = span.get("offset", 0)
+                length = span.get("length", 0)
+                text = full_content[offset:offset + length]
+
+                handwritten.append({
+                    "text": text,
+                    "offset": offset,
+                    "length": length,
+                    "confidence": style.get("confidence"),
+                })
+
+    return handwritten
+
+
+def get_low_confidence_words(p: dict, threshold: float = WORD_CONFIDENCE_THRESHOLD) -> list[dict]:
+    """
+    Return words on a page whose confidence is below the threshold.
+    """
+    lowconf_words = []
+
+    for word in p.get("words", []):
+        confidence = word.get("confidence")
+        if confidence is not None and confidence < threshold:
+            lowconf_words.append({
+                "content": word.get("content", ""),
+                "confidence": confidence,
+                "polygon": word.get("polygon"),
+            })
+
+    return lowconf_words
+
+
+def estimate_field_confidence(field_value: str | None, p: dict) -> float | None:
+    """
+    Estimate field confidence by matching the extracted value against page words.
+    Returns the best matching word confidence if found.
+    """
+    if not field_value:
+        return None
+
+    field_value_clean = str(field_value).strip().lower()
+
+    best_confidence = None
+
+    for word in p.get("words", []):
+        word_text = str(word.get("content", "")).strip().lower()
+        confidence = word.get("confidence")
+
+        if not word_text or confidence is None:
+            continue
+
+        if word_text == field_value_clean or field_value_clean in word_text or word_text in field_value_clean:
+            if best_confidence is None or confidence > best_confidence:
+                best_confidence = confidence
+
+    return best_confidence
+
+
+def build_field_review_flags(fields: dict, p: dict, threshold: float = FIELD_CONFIDENCE_THRESHOLD) -> list[dict]:
+    """
+    Build review flags for extracted fields with low estimated confidence.
+    """
+    flags = []
+
+    for field_name, field_value in fields.items():
+        if field_value in [None, ""]:
+            continue
+
+        estimated_confidence = estimate_field_confidence(field_value, p)
+
+        if estimated_confidence is not None and estimated_confidence < threshold:
+            flags.append({
+                "field_name": field_name,
+                "field_value": field_value,
+                "confidence": estimated_confidence,
+                "reason": "Low OCR confidence for extracted field",
+            })
+
+    return flags
 
 
 def normalize_prebuilt_result(result: dict) -> dict:
@@ -205,9 +299,9 @@ def normalize_prebuilt_result(result: dict) -> dict:
     detected_batch_numbers = []
     detected_lot_numbers = []
 
-    for page in result.get("pages", []):
-        page_number = page["page_number"]
-        page_text = "\n".join(line["content"] for line in page.get("lines", []))
+    for p in result.get("pages", []):
+        pagenum = p["page_number"]
+        page_text = "\n".join(line["content"] for line in p.get("lines", []))
         page_type = classify_page(page_text)
 
         batch_number = extract_with_patterns(
@@ -251,17 +345,39 @@ def normalize_prebuilt_result(result: dict) -> dict:
         if lot_number:
             detected_lot_numbers.append(lot_number)
 
+        fields = {
+            "batch_number": batch_number,
+            "lot_number": lot_number,
+            "date": date_value,
+            "operator": operator,
+        }
+
+        low_confidence_words = get_low_confidence_words(p)
+        field_review_flags = build_field_review_flags(fields, p)
+
+        page_warnings = []
+
+        if low_confidence_words:
+            page_warnings.append(
+                f"{len(low_confidence_words)} low-confidence OCR word(s) detected on page {pagenum}"
+            )
+
+        if field_review_flags:
+            page_warnings.append(
+                f"{len(field_review_flags)} extracted field(s) flagged for review on page {pagenum}"
+            )
+
         normalized["pages"].append(
             {
-                "page_number": page_number,
+                "page_number": pagenum,
                 "page_type": page_type,
                 "ocr_text": page_text,
-                "fields": {
-                    "batch_number": batch_number,
-                    "lot_number": lot_number,
-                    "date": date_value,
-                    "operator": operator,
+                "fields": fields,
+                "review_flags": {
+                    "low_confidence_words": low_confidence_words[:MAX_LOW_CONFIDENCE_WORDS_TO_SHOW],
+                    "field_flags": field_review_flags,
                 },
+                "page_warnings": page_warnings,
             }
         )
 
@@ -280,6 +396,14 @@ def normalize_prebuilt_result(result: dict) -> dict:
             normalized["validation_warnings"].append(
                 f"Multiple lot numbers detected: {dict(lot_counts)}"
             )
+
+    for p in normalized["pages"]:
+        if not p["fields"]["batch_number"]:
+            p["fields"]["batch_number"] = normalized["document_batch_number"]
+        if not p["fields"]["lot_number"]:
+            p["fields"]["lot_number"] = normalized["document_lot_number"]
+        for warn in p.get("page_warnings", []):
+            normalized["validation_warnings"].append(warn)
 
     return normalized
 
@@ -301,11 +425,11 @@ def normalize_custom_result(result: dict) -> dict:
         def get_field_value(*names):
             for name in names:
                 if name in fields:
-                    field_obj = fields[name]
-                    for key in ["value_string", "value_date", "value_time", "content", "value_number"]:
-                        value = field_obj.get(key)
-                        if value is not None:
-                            return str(value)
+                    f_name = fields[name]
+                    for k in ["value_string", "value_date", "value_time", "content", "value_number"]:
+                        v = f_name.get(k)
+                        if v is not None:
+                            return str(v)
             return None
 
         batch_number = get_field_value("batch_number", "BatchNumber", "Batch_Number")
@@ -323,6 +447,41 @@ def normalize_custom_result(result: dict) -> dict:
         if lot_number and not normalized["document_lot_number"]:
             normalized["document_lot_number"] = lot_number
 
+        all_field_names = ["batch_number",
+                           "lot_number",
+                           "date",
+                           "operator",
+                           "material_name",
+                           "material_lot",
+                           "quantity"]
+
+        all_field_flags = []
+
+        for field_name in all_field_names:
+            candidate_names = [field_name,
+                               field_name.title().replace("_", ""),
+                               field_name.replace("_", "")]
+
+            for candidate_name in candidate_names:
+                if candidate_name in fields:
+                    field_obj = fields[candidate_name]
+                    confidence = field_obj.get("confidence")
+                    value = None
+
+                    for key in ["value_string", "value_date", "value_time", "content", "value_number"]:
+                        if field_obj.get(key) is not None:
+                            value = str(field_obj.get(key))
+                            break
+
+                    if value is not None and confidence is not None and confidence < FIELD_CONFIDENCE_THRESHOLD:
+                        all_field_flags.append({
+                            "field_name": field_name,
+                            "field_value": value,
+                            "confidence": confidence,
+                            "reason": "Low custom model confidence",
+                        })
+                    break
+
         normalized["pages"].append(
             {
                 "page_number": idx,
@@ -338,20 +497,38 @@ def normalize_custom_result(result: dict) -> dict:
                     "quantity": quantity,
                 },
                 "confidence": doc.get("confidence"),
+                "review_flags": {
+                    "field_flags": all_field_flags,
+                },
+                "page_warnings": [
+                    f"{len(all_field_flags)} extracted field(s) flagged for review on page {idx}"
+                ] if all_field_flags else [],
             }
         )
+
+        for p in normalized["pages"]:
+            if not p["fields"]["batch_number"]:
+                p["fields"]["batch_number"] = normalized["document_batch_number"]
+            if not p["fields"]["lot_number"]:
+                p["fields"]["lot_number"] = normalized["document_lot_number"]
+            for warn in p.get("page_warnings", []):
+                normalized["validation_warnings"].append(warn)
 
     return normalized
 
 
 def build_summary_dataframe(normalized: dict) -> pd.DataFrame:
     rows = []
-    for page in normalized.get("pages", []):
+    for p in normalized.get("pages", []):
         row = {
-            "page_number": page.get("page_number"),
-            "page_type": page.get("page_type"),
+            "page_number": p.get("page_number"),
+            "page_type": p.get("page_type"),
+            "needs_review": bool(
+                p.get("review_flags", {}).get("field_flags")
+                or p.get("review_flags", {}).get("low_confidence_words")
+            ),
         }
-        row.update(page.get("fields", {}))
+        row.update(p.get("fields", {}))
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -437,6 +614,30 @@ if uploaded_file is not None:
                 st.subheader("Summary Table")
                 df = build_summary_dataframe(normalized_result)
                 st.dataframe(df, width='stretch')
+
+                st.subheader("Confidence-Based Review Flags")
+
+                flag_count = 0
+
+                for page in normalized_result.get("pages", []):
+                    page_number = page.get("page_number")
+                    review_flags = page.get("review_flags", {})
+                    field_flags = review_flags.get("field_flags", [])
+                    low_conf_words = review_flags.get("low_confidence_words", [])
+
+                    if field_flags or low_conf_words:
+                        flag_count += 1
+                        with st.expander(f"Page {page_number} review flags"):
+                            if field_flags:
+                                st.write("### Field Flags")
+                                st.json(field_flags)
+
+                            if low_conf_words:
+                                st.write("### Low-Confidence OCR Words")
+                                st.json(low_conf_words)
+
+                if flag_count == 0:
+                    st.success("No confidence-based review flags found.")
 
                 output_package = {
                     "normalized_result": normalized_result,
