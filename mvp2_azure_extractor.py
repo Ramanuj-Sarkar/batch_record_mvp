@@ -7,6 +7,8 @@ from typing import Any
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
+from pypdf import PdfReader
+from io import BytesIO
 
 
 class AzureDocIntExtractor:
@@ -25,6 +27,21 @@ class AzureDocIntExtractor:
             endpoint=self.endpoint,
             credential=AzureKeyCredential(self.key),
         )
+
+    def get_pdf_page_count(self, pdf_bytes: bytes) -> int:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        return len(reader.pages)
+
+    def build_page_ranges(self, total_pages: int, chunk_size: int = 50) -> list[str]:
+        ranges = []
+        start = 1
+
+        while start <= total_pages:
+            end = min(start + chunk_size - 1, total_pages)
+            ranges.append(f"{start}-{end}")
+            start = end + 1
+
+        return ranges
 
     def analyze_read(self, pdf_bytes: bytes, pages: str | None = None) -> dict[str, Any]:
         poller = self.client.begin_analyze_document(
@@ -60,6 +77,86 @@ class AzureDocIntExtractor:
         )
         result = poller.result()
         return self._custom_result_to_dict(result)
+
+    def analyze_read_chunked(
+        self,
+        pdf_bytes: bytes,
+        chunk_size: int = 50,
+    ) -> dict[str, Any]:
+        total_pages = self.get_pdf_page_count(pdf_bytes)
+        page_ranges = self.build_page_ranges(total_pages, chunk_size)
+
+        chunk_results = []
+        for page_range in page_ranges:
+            chunk_results.append(self.analyze_read(pdf_bytes, pages=page_range))
+
+        return self._merge_read_like_results(chunk_results, method="azure_prebuilt_read_chunked")
+
+    def analyze_layout_chunked(
+        self,
+        pdf_bytes: bytes,
+        chunk_size: int = 50,
+    ) -> dict[str, Any]:
+        total_pages = self.get_pdf_page_count(pdf_bytes)
+        page_ranges = self.build_page_ranges(total_pages, chunk_size)
+
+        chunk_results = []
+        for page_range in page_ranges:
+            chunk_results.append(self.analyze_layout(pdf_bytes, pages=page_range))
+
+        return self._merge_layout_results(chunk_results, method="azure_prebuilt_layout_chunked")
+
+    def analyze_custom_chunked(
+        self,
+        pdf_bytes: bytes,
+        model_id: str,
+        chunk_size: int = 50,
+    ) -> dict[str, Any]:
+        total_pages = self.get_pdf_page_count(pdf_bytes)
+        page_ranges = self.build_page_ranges(total_pages, chunk_size)
+
+        chunk_results = []
+        for page_range in page_ranges:
+            chunk_results.append(self.analyze_custom(pdf_bytes, model_id=model_id, pages=page_range))
+
+        return self._merge_custom_results(chunk_results, method="azure_custom_extraction_chunked")
+
+    def _merge_read_like_results(self, chunk_results: list[dict], method: str) -> dict[str, Any]:
+        merged_pages = []
+
+        for result in chunk_results:
+            merged_pages.extend(result.get("pages", []))
+
+        merged_pages.sort(key=lambda p: p["page_number"])
+
+        return {
+            "method": method,
+            "pages": merged_pages,
+        }
+
+    def _merge_layout_results(self, chunk_results: list[dict], method: str) -> dict[str, Any]:
+        merged = self._merge_read_like_results(chunk_results, method=method)
+        merged["tables"] = []
+        merged["paragraphs"] = []
+        merged["styles"] = []
+
+        for result in chunk_results:
+            merged["tables"].extend(result.get("tables", []))
+            merged["paragraphs"].extend(result.get("paragraphs", []))
+            merged["styles"].extend(result.get("styles", []))
+
+        return merged
+
+    def _merge_custom_results(self, chunk_results: list[dict], method: str) -> dict[str, Any]:
+        merged_documents = []
+
+        for result in chunk_results:
+            merged_documents.extend(result.get("documents", []))
+
+        return {
+            "method": method,
+            "documents": merged_documents,
+        }
 
     def _read_result_to_dict(self, result) -> dict[str, Any]:
         pages_out = []
@@ -145,17 +242,17 @@ class AzureDocIntExtractor:
                             getattr(table, "bounding_regions", None)
                         ),
                         "cells": [
-                                    {
-                                        "row_index": int(cell.row_index),
-                                        "column_index": int(cell.column_index),
-                                        "content": cell.content,
-                                        "kind": getattr(cell, "kind", None),
-                                        "bounding_regions": self._normalize_bounding_regions(
-                                            getattr(cell, "bounding_regions", None)
-                                        ),
-                                    }
-                                    for cell in table.cells
-                                ],
+                            {
+                                "row_index": int(cell.row_index),
+                                "column_index": int(cell.column_index),
+                                "content": cell.content,
+                                "kind": getattr(cell, "kind", None),
+                                "bounding_regions": self._normalize_bounding_regions(
+                                    getattr(cell, "bounding_regions", None)
+                                ),
+                            }
+                            for cell in table.cells
+                        ],
                     }
                 )
 
@@ -183,8 +280,6 @@ class AzureDocIntExtractor:
                                 if getattr(field, "value_time", None)
                                 else None
                             ),
-                            "value_phone_number": getattr(field, "value_phone_number", None),
-                            "value_selection_mark": getattr(field, "value_selection_mark", None),
                             "content": getattr(field, "content", None),
                             "confidence": (
                                 float(field.confidence)

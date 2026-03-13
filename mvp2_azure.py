@@ -621,25 +621,41 @@ if uploaded_file is not None:
     if process_clicked and pdf_bytes is not None:
         with st.spinner("Sending document to Azure Document Intelligence..."):
             try:
+                page_count = azure_extractor.get_pdf_page_count(pdf_bytes)
+
                 if model_choice == "prebuilt-read":
-                    raw_result = azure_extractor.analyze_read(
-                        pdf_bytes,
-                        pages=pages_to_process or None,
-                    )
+                    if page_count > 50 and not pages_to_process:
+                        raw_result = azure_extractor.analyze_read_chunked(pdf_bytes, chunk_size=50)
+                    else:
+                        raw_result = azure_extractor.analyze_read(
+                            pdf_bytes,
+                            pages=pages_to_process or None,
+                        )
                     normalized_result = normalize_prebuilt_result(raw_result)
 
                 elif model_choice == "prebuilt-layout":
-                    raw_result = azure_extractor.analyze_layout(
-                        pdf_bytes,
-                        pages=pages_to_process or None,
-                    )
+                    if page_count > 50 and not pages_to_process:
+                        raw_result = azure_extractor.analyze_layout_chunked(pdf_bytes, chunk_size=50)
+                    else:
+                        raw_result = azure_extractor.analyze_layout(
+                            pdf_bytes,
+                            pages=pages_to_process or None,
+                        )
                     normalized_result = normalize_prebuilt_result(raw_result)
+
                 else:
-                    raw_result = azure_extractor.analyze_custom(
-                        pdf_bytes,
-                        model_id=custom_model_id,
-                        pages=pages_to_process or None,
-                    )
+                    if page_count > 50 and not pages_to_process:
+                        raw_result = azure_extractor.analyze_custom_chunked(
+                            pdf_bytes,
+                            model_id=custom_model_id,
+                            chunk_size=50,
+                        )
+                    else:
+                        raw_result = azure_extractor.analyze_custom(
+                            pdf_bytes,
+                            model_id=custom_model_id,
+                            pages=pages_to_process or None,
+                        )
                     normalized_result = normalize_custom_result(raw_result)
 
                 parsed_tables = []
