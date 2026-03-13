@@ -14,7 +14,7 @@ import json
 import os
 import re
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor  # implement threading
+import hashlib
 
 import pandas as pd
 import streamlit as st
@@ -27,6 +27,27 @@ FIELD_CONFIDENCE_THRESHOLD = 0.75
 MAX_LOW_CONFIDENCE_WORDS_TO_SHOW = 15
 
 load_dotenv()
+
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+
+if "raw_result" not in st.session_state:
+    st.session_state.raw_result = None
+
+if "normalized_result" not in st.session_state:
+    st.session_state.normalized_result = None
+
+if "parsed_tables" not in st.session_state:
+    st.session_state.parsed_tables = []
+
+if "summary_df" not in st.session_state:
+    st.session_state.summary_df = None
+
+if "document_name" not in st.session_state:
+    st.session_state.document_name = None
+
+if "document_hash" not in st.session_state:
+    st.session_state.document_hash = None
 
 st.set_page_config(page_title="Azure Batch Record Extraction MVP", layout="wide")
 
@@ -556,29 +577,48 @@ with st.sidebar:
 
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
-model_choice = st.selectbox(
-    "Choose Azure model",
-    ["prebuilt-layout", "prebuilt-read"],  # can add and test "custom_model" at later date
-)
-
-pages_to_process = st.text_input(
-    "Pages to process (optional)",
-    placeholder="Example: 1-3 or 1,3,5",
-)
-
-default_custom_model_id = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_CUSTOM_MODEL_ID", "")
-custom_model_id = ""
-
-if model_choice == "custom-model":
-    custom_model_id = st.text_input(
-        "Custom model ID",
-        value=default_custom_model_id,
-    )
+pdf_bytes = None
+current_doc_hash = None
 
 if uploaded_file is not None:
     pdf_bytes = uploaded_file.read()
+    current_doc_hash = hashlib.md5(pdf_bytes).hexdigest()
 
-    if st.button("Process Document"):
+    if (
+        st.session_state.document_hash is not None
+        and st.session_state.document_hash != current_doc_hash
+    ):
+        st.session_state.processed = False
+        st.session_state.raw_result = None
+        st.session_state.normalized_result = None
+        st.session_state.parsed_tables = []
+        st.session_state.summary_df = None
+
+    st.session_state.document_hash = current_doc_hash
+    st.session_state.document_name = uploaded_file.name
+
+with st.form("process_form"):
+    model_choice = st.selectbox(
+        "Choose Azure model",
+        ["prebuilt-layout", "prebuilt-read"],
+    )
+
+    pages_to_process = st.text_input(
+        "Pages to process (optional)",
+        placeholder="Example: 1-3 or 1,3,5",
+    )
+
+    custom_model_id = ""
+    if model_choice == "custom-model":
+        custom_model_id = st.text_input(
+            "Custom model ID",
+            value=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_CUSTOM_MODEL_ID", ""),
+        )
+
+    process_clicked = st.form_submit_button("Process Document")
+
+if uploaded_file is not None:
+    if process_clicked and pdf_bytes is not None:
         with st.spinner("Sending document to Azure Document Intelligence..."):
             try:
                 if model_choice == "prebuilt-read":
@@ -608,48 +648,7 @@ if uploaded_file is not None:
 
                 st.success("Document processed successfully.")
 
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    with st.expander("Show Normalized Batch Record Output"):
-                        st.json(normalized_result)
-
-                with col2:
-                    with st.expander("Show Raw Azure Output"):
-                        st.json(raw_result)
-
-                if normalized_result.get("validation_warnings"):
-                    st.subheader("Validation Warnings")
-                    for warning in normalized_result["validation_warnings"]:
-                        st.warning(warning)
-
-                st.subheader("Summary Table")
                 df = build_summary_dataframe(normalized_result)
-                st.dataframe(df, width='stretch')
-
-                st.subheader("Confidence-Based Review Flags")
-
-                flag_count = 0
-
-                for page in normalized_result.get("pages", []):
-                    page_number = page.get("page_number")
-                    review_flags = page.get("review_flags", {})
-                    field_flags = review_flags.get("field_flags", [])
-                    low_conf_words = review_flags.get("low_confidence_words", [])
-
-                    if field_flags or low_conf_words:
-                        flag_count += 1
-                        with st.expander(f"Page {page_number} review flags"):
-                            if field_flags:
-                                st.write("### Field Flags")
-                                st.json(field_flags)
-
-                            if low_conf_words:
-                                st.write("### Low-Confidence OCR Words")
-                                st.json(low_conf_words)
-
-                if flag_count == 0:
-                    st.success("No confidence-based review flags found.")
 
                 output_package = {
                     "normalized_result": normalized_result,
@@ -659,46 +658,110 @@ if uploaded_file is not None:
                 normalized_json = json.dumps(output_package, indent=2)
                 raw_json = json.dumps(raw_result, indent=2)
 
-                if parsed_tables:
-                    st.subheader("Parsed Azure Tables")
-
-                    for table in parsed_tables:
-                        if 'event_type' in table:
-                            continue
-                        elif 'table_index' in table:
-                            st.write(
-                                f"Table {table['table_index']} "
-                                f"({table['row_count']} rows x {table['column_count']} columns)"
-                            )
-
-                            table_rows = table["rows"]
-                            if table_rows:
-                                table_df = pd.DataFrame(table_rows)
-                                st.dataframe(table_df, width='stretch')
-                            else:
-                                st.info("No parsed rows found for this table.")
-
-                st.download_button(
-                    label="Download Normalized JSON",
-                    data=normalized_json,
-                    file_name="batch_record_normalized.json",
-                    mime="application/json",
-                )
-
-                st.download_button(
-                    label="Download Raw Azure JSON",
-                    data=raw_json,
-                    file_name="batch_record_raw_azure.json",
-                    mime="application/json",
-                )
-
-                csv_output = df.to_csv(index=False)
-                st.download_button(
-                    label="Download CSV Summary",
-                    data=csv_output,
-                    file_name="batch_record_summary.csv",
-                    mime="text/csv",
-                )
+                st.session_state.raw_result = raw_result
+                st.session_state.normalized_result = normalized_result
+                st.session_state.parsed_tables = parsed_tables
+                st.session_state.summary_df = df
+                st.session_state.document_name = uploaded_file.name
+                st.session_state.processed = True
 
             except Exception as e:
                 st.error(f"Error processing document: {e}")
+
+if st.session_state.processed and st.session_state.normalized_result is not None:
+    raw_result = st.session_state.raw_result
+    normalized_result = st.session_state.normalized_result
+    parsed_tables = st.session_state.parsed_tables
+    df = st.session_state.summary_df
+
+    st.success(f"Showing saved results for: {st.session_state.document_name}")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        with st.expander("Show Normalized Batch Record Output"):
+            st.json(normalized_result)
+
+    with col2:
+        with st.expander("Show Raw Azure Output"):
+            st.json(raw_result)
+
+    if normalized_result.get("validation_warnings"):
+        with st.expander("Show Validation Warnings"):
+            for warning in normalized_result["validation_warnings"]:
+                st.warning(warning)
+
+    st.subheader("Summary Table")
+    st.dataframe(df, width='stretch')
+
+    flag_count = 0
+
+    with st.expander("Show Low-Confidence OCR Words"):
+        for page in normalized_result.get("pages", []):
+            page_number = page.get("page_number")
+            review_flags = page.get("review_flags", {})
+            field_flags = review_flags.get("field_flags", [])
+            low_conf_words = review_flags.get("low_confidence_words", [])
+
+            if field_flags or low_conf_words:
+                flag_count += 1
+                with st.expander(f"Page {page_number} review flags"):
+                    if field_flags:
+                        st.write("### Field Flags")
+                        st.json(field_flags)
+
+                    if low_conf_words:
+                        st.write("### Low-Confidence OCR Words")
+                        st.json(low_conf_words)
+
+    if flag_count == 0:
+        st.success("No confidence-based review flags found.")
+
+    if parsed_tables:
+        with st.expander("Show Parsed Azure Tables"):
+
+            for table in parsed_tables:
+                if 'event_type' in table:
+                    continue
+                elif 'table_index' in table:
+                    st.write(
+                        f"Table {table['table_index']} "
+                        f"({table['row_count']} rows x {table['column_count']} columns)"
+                    )
+
+                    table_rows = table["rows"]
+                    if table_rows:
+                        table_df = pd.DataFrame(table_rows)
+                        st.dataframe(table_df, width='stretch')
+                    else:
+                        st.info("No parsed rows found for this table.")
+
+    output_package = {
+        "normalized_result": normalized_result,
+        "parsed_tables": parsed_tables,
+    }
+
+    normalized_json = json.dumps(output_package, indent=2)
+    raw_json = json.dumps(raw_result, indent=2)
+    csv_output = df.to_csv(index=False)
+
+    st.download_button(
+        label="Download Normalized JSON",
+        data=normalized_json,
+        file_name="batch_record_normalized.json",
+        mime="application/json",
+    )
+
+    st.download_button(
+        label="Download Raw Azure JSON",
+        data=raw_json,
+        file_name="batch_record_raw_azure.json",
+        mime="application/json",
+    )
+
+    st.download_button(
+        label="Download CSV Summary",
+        data=csv_output,
+        file_name="batch_record_summary.csv",
+        mime="text/csv",
+    )
