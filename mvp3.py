@@ -1,0 +1,809 @@
+"""
+MVP 2: Batch Record Extraction with Confidence
+
+This version improves upon the previous MVP by adding
+confidence data which focuses on possible issues,
+methods to fill in data missing from specific pages,
+and a different format for tables which incorporates data better.
+
+Goal:
+Enhance previous MVP by adding confidence data
+and ability to incorporate AI tools when appropriate.
+"""
+import json
+import os
+import re
+from collections import Counter
+import hashlib
+
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+
+from mvp3_extractor import AzureDocIntExtractor
+
+WORD_CONFIDENCE_THRESHOLD = 0.75
+FIELD_CONFIDENCE_THRESHOLD = 0.75
+MAX_LOW_CONFIDENCE_WORDS_TO_SHOW = 15
+
+load_dotenv()
+
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+
+if "raw_result" not in st.session_state:
+    st.session_state.raw_result = None
+
+if "normalized_result" not in st.session_state:
+    st.session_state.normalized_result = None
+
+if "parsed_tables" not in st.session_state:
+    st.session_state.parsed_tables = []
+
+if "summary_df" not in st.session_state:
+    st.session_state.summary_df = None
+
+if "document_name" not in st.session_state:
+    st.session_state.document_name = None
+
+if "document_hash" not in st.session_state:
+    st.session_state.document_hash = None
+
+if "download_log" not in st.session_state:
+    st.session_state.download_log = []
+
+st.set_page_config(page_title="Azure Batch Record Extraction MVP", layout="wide")
+
+st.title("Biopharma Batch Record Extraction - Azure Version")
+st.write(
+    "Upload a PDF batch record and process it with Azure Document Intelligence. "
+    "This version supports prebuilt OCR/layout analysis."
+)
+
+
+@st.cache_resource
+def load_azure_extractor():
+    return AzureDocIntExtractor()
+
+
+def extract_with_patterns(text: str, patterns: list[str]):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def polygon_to_bbox(polygon: list) -> dict | None:
+    """
+    Convert Azure polygon [x1,y1,x2,y2,x3,y3,x4,y4] to bounding box.
+    """
+    if not polygon or len(polygon) < 8:
+        return None
+
+    xs = polygon[0::2]
+    ys = polygon[1::2]
+
+    return {
+        "x_min": min(xs),
+        "y_min": min(ys),
+        "x_max": max(xs),
+        "y_max": max(ys),
+    }
+
+
+def word_center_in_bbox(word_polygon, cell_bbox) -> bool:
+    """
+    Check whether the center of a word polygon lies inside a cell bbox.
+    """
+    if not word_polygon or not cell_bbox:
+        return False
+
+    xs = word_polygon[0::2]
+    ys = word_polygon[1::2]
+
+    x_center = sum(xs) / len(xs)
+    y_center = sum(ys) / len(ys)
+
+    return (
+        cell_bbox["x_min"] <= x_center <= cell_bbox["x_max"]
+        and cell_bbox["y_min"] <= y_center <= cell_bbox["y_max"]
+    )
+
+
+def recover_cell_text_from_words(cell: dict, pages: list[dict]) -> str:
+    """
+    Recover cell text by finding page words whose centers fall inside the cell polygon.
+    """
+    bounding_regions = cell.get("bounding_regions", [])
+    if not bounding_regions:
+        return ""
+
+    recovered_words = []
+
+    for region in bounding_regions:
+        pagenum = region.get("page_number")
+        polygon = region.get("polygon")
+        cell_bbox = polygon_to_bbox(polygon)
+
+        if not cell_bbox:
+            continue
+
+        matching_page = next(
+            (p for p in pages if p.get("page_number") == pagenum),
+            None
+        )
+
+        if not matching_page:
+            continue
+
+        for word in matching_page.get("words", []):
+            word_polygon = word.get("polygon")
+            if word_center_in_bbox(word_polygon, cell_bbox):
+                recovered_words.append(word.get("content", ""))
+
+    return " ".join(w for w in recovered_words if w).strip()
+
+
+def parse_azure_table(t: dict, pages: list[dict]) -> list[dict]:
+    """
+    Convert one Azure table object into a list of row dictionaries.
+
+    Uses cell.content first.
+    If cell.content is empty, tries to recover text from page words
+    inside the cell bounding box.
+    Assumes row 0 contains headers.
+    """
+    rows = {}
+
+    for cell in t.get("cells", []):
+        r = cell["row_index"]
+        c = cell["column_index"]
+
+        text = (cell.get("content") or "").strip()
+
+        if not text:
+            text = recover_cell_text_from_words(cell, pages)
+
+        if r not in rows:
+            rows[r] = {}
+
+        column_name = c
+        rows[r][column_name] = text
+
+    pre_table = list(rows.values())
+
+    return pre_table
+
+
+def parse_all_azure_tables(rr: dict) -> list[dict]:
+    """
+    Parse all Azure tables into structured row-based output.
+    """
+    parsed_t = []
+    pages = rr.get("pages", [])
+
+    for idx, t in enumerate(rr.get("tables", []), start=1):
+        parsed_rows = parse_azure_table(t, pages)
+
+        parsed_t.append({
+            "table_index": idx,
+            "row_count": t.get("row_count"),
+            "column_count": t.get("column_count"),
+            "rows": parsed_rows,
+        })
+
+    return parsed_t
+
+
+def classify_page(text: str) -> str:
+    if "batch number" in text.lower():
+        return "header_page"
+
+    if "material" in text.lower():
+        return "material_page"
+
+    if "time" in text.lower() and "temperature" in text.lower():
+        return "process_log_page"
+
+    return "unknown_page"
+
+
+def extract_handwritten_spans(rr: dict) -> list[dict]:
+    handwritten = []
+
+    full_content = rr.get("content", "")
+    styles = rr.get("styles", [])
+
+    for style in styles:
+        if style.get("is_handwritten") is True:
+            for span in style.get("spans", []):
+                offset = span.get("offset", 0)
+                length = span.get("length", 0)
+                text = full_content[offset:offset + length]
+
+                handwritten.append({
+                    "text": text,
+                    "offset": offset,
+                    "length": length,
+                    "confidence": style.get("confidence"),
+                })
+
+    return handwritten
+
+
+def get_low_confidence_words(p: dict, threshold: float = WORD_CONFIDENCE_THRESHOLD) -> list[dict]:
+    """
+    Return words on a page whose confidence is below the threshold.
+    """
+    lowconf_words = []
+
+    for word in p.get("words", []):
+        confidence = word.get("confidence")
+        if confidence is not None and confidence < threshold:
+            lowconf_words.append({
+                "content": word.get("content", ""),
+                "confidence": confidence,
+                "polygon": word.get("polygon"),
+            })
+
+    return lowconf_words
+
+
+def estimate_field_confidence(field_value: str | None, p: dict) -> float | None:
+    """
+    Estimate field confidence by matching the extracted value against page words.
+    Returns the best matching word confidence if found.
+    """
+    if not field_value:
+        return None
+
+    field_value_clean = str(field_value).strip().lower()
+
+    best_confidence = None
+
+    for word in p.get("words", []):
+        word_text = str(word.get("content", "")).strip().lower()
+        confidence = word.get("confidence")
+
+        if not word_text or confidence is None:
+            continue
+
+        if word_text == field_value_clean or field_value_clean in word_text or word_text in field_value_clean:
+            if best_confidence is None or confidence > best_confidence:
+                best_confidence = confidence
+
+    return best_confidence
+
+
+def build_field_review_flags(fields: dict, p: dict, threshold: float = FIELD_CONFIDENCE_THRESHOLD) -> list[dict]:
+    """
+    Build review flags for extracted fields with low estimated confidence.
+    """
+    flags = []
+
+    for field_name, field_value in fields.items():
+        if field_value in [None, ""]:
+            continue
+
+        estimated_confidence = estimate_field_confidence(field_value, p)
+
+        if estimated_confidence is not None and estimated_confidence < threshold:
+            flags.append({
+                "field_name": field_name,
+                "field_value": field_value,
+                "confidence": estimated_confidence,
+                "reason": "Low OCR confidence for extracted field",
+            })
+
+    return flags
+
+
+def normalize_prebuilt_result(result: dict) -> dict:
+    """
+    Normalize Azure prebuilt-read or prebuilt-layout output into a simple schema.
+    """
+    normalized = {
+        "document_batch_number": None,
+        "document_lot_number": None,
+        "pages": [],
+        "validation_warnings": [],
+    }
+
+    detected_batch_numbers = []
+    detected_lot_numbers = []
+
+    for p in result.get("pages", []):
+        pagenum = p["page_number"]
+        page_text = "\n".join(line["content"] for line in p.get("lines", []))
+        page_type = classify_page(page_text)
+
+        batch_number = extract_with_patterns(
+            page_text,
+            [
+                r"Batch\s*Number[:\-]?\s*([A-Za-z0-9\-\/]+)",
+                r"Batch\s*Record\s*:\n*\s*([A-Za-z0-9\-\/]+)"
+                r"Batch\s*No[:\-]?\s*([A-Za-z0-9\-\/]+)",
+                r"BMR\s*No\s*.:\s*([A-Za-z0-9\-\/]+)"
+            ],
+        )
+
+        lot_number = extract_with_patterns(
+            page_text,
+            [
+                r"Lot\s*Number[:\-]?\s*([A-Za-z0-9\-\/]+)",
+                r"Lot\s*No[:\-]?\s*([A-Za-z0-9\-\/]+)",
+                r"Lot[:\-]?\s*([A-Za-z0-9\-\/]+)",
+            ],
+        )
+
+        date_value = extract_with_patterns(
+            page_text,
+            [
+                r"Date[:\-]?\s*([0-9]{1,2}[\/\-][0-9]{1,2}[\/\-][0-9]{2,4})",
+            ],
+        )
+
+        operator = extract_with_patterns(
+            page_text,
+            [
+                r"Operator[:\-]?\s*([A-Za-z]{1,20})",
+                r"Operator\s*Initials[:\-]?\s*([A-Za-z]{1,10})",
+                r"Initials[:\-]?\s*([A-Za-z]{1,10})",
+            ],
+        )
+
+        if batch_number:
+            detected_batch_numbers.append(batch_number)
+
+        if lot_number:
+            detected_lot_numbers.append(lot_number)
+
+        fields = {
+            "batch_number": batch_number,
+            "lot_number": lot_number,
+            "date": date_value,
+            "operator": operator,
+        }
+
+        low_confidence_words = get_low_confidence_words(p)
+        field_review_flags = build_field_review_flags(fields, p)
+
+        page_warnings = []
+
+        if low_confidence_words:
+            page_warnings.append(
+                f"{len(low_confidence_words)} low-confidence OCR word(s) detected on page {pagenum}"
+            )
+
+        if field_review_flags:
+            page_warnings.append(
+                f"{len(field_review_flags)} extracted field(s) flagged for review on page {pagenum}"
+            )
+
+        normalized["pages"].append(
+            {
+                "page_number": pagenum,
+                "page_type": page_type,
+                "ocr_text": page_text,
+                "fields": fields,
+                "review_flags": {
+                    "low_confidence_words": low_confidence_words[:MAX_LOW_CONFIDENCE_WORDS_TO_SHOW],
+                    "field_flags": field_review_flags,
+                },
+                "page_warnings": page_warnings,
+            }
+        )
+
+    if detected_batch_numbers:
+        batch_counts = Counter(detected_batch_numbers)
+        normalized["document_batch_number"] = batch_counts.most_common(1)[0][0]
+        if len(batch_counts) > 1:
+            normalized["validation_warnings"].append(
+                f"Multiple batch numbers detected: {dict(batch_counts)}"
+            )
+
+    if detected_lot_numbers:
+        lot_counts = Counter(detected_lot_numbers)
+        normalized["document_lot_number"] = lot_counts.most_common(1)[0][0]
+        if len(lot_counts) > 1:
+            normalized["validation_warnings"].append(
+                f"Multiple lot numbers detected: {dict(lot_counts)}"
+            )
+
+    for p in normalized["pages"]:
+        if not p["fields"]["batch_number"]:
+            p["fields"]["batch_number"] = normalized["document_batch_number"]
+        if not p["fields"]["lot_number"]:
+            p["fields"]["lot_number"] = normalized["document_lot_number"]
+        for warn in p.get("page_warnings", []):
+            normalized["validation_warnings"].append(warn)
+
+    return normalized
+
+
+def normalize_custom_result(result: dict) -> dict:
+    """
+    Normalize Azure custom model output into the same simple schema.
+    """
+    normalized = {
+        "document_batch_number": None,
+        "document_lot_number": None,
+        "pages": [],
+        "validation_warnings": [],
+    }
+
+    for idx, doc in enumerate(result.get("documents", []), start=1):
+        fields = doc.get("fields", {})
+
+        def get_field_value(*names):
+            for name in names:
+                if name in fields:
+                    f_name = fields[name]
+                    for k in ["value_string", "value_date", "value_time", "content", "value_number"]:
+                        v = f_name.get(k)
+                        if v is not None:
+                            return str(v)
+            return None
+
+        batch_number = get_field_value("batch_number", "BatchNumber", "Batch_Number")
+        lot_number = get_field_value("lot_number", "LotNumber", "Lot_Number")
+        date_value = get_field_value("date", "Date", "ManufactureDate")
+        operator = get_field_value("operator", "Operator", "OperatorInitials")
+
+        material_name = get_field_value("material_name", "MaterialName")
+        material_lot = get_field_value("material_lot", "MaterialLot")
+        quantity = get_field_value("quantity", "Quantity", "QuantityAdded")
+
+        if batch_number and not normalized["document_batch_number"]:
+            normalized["document_batch_number"] = batch_number
+
+        if lot_number and not normalized["document_lot_number"]:
+            normalized["document_lot_number"] = lot_number
+
+        all_field_names = ["batch_number",
+                           "lot_number",
+                           "date",
+                           "operator",
+                           "material_name",
+                           "material_lot",
+                           "quantity"]
+
+        all_field_flags = []
+
+        for field_name in all_field_names:
+            candidate_names = [field_name,
+                               field_name.title().replace("_", ""),
+                               field_name.replace("_", "")]
+
+            for candidate_name in candidate_names:
+                if candidate_name in fields:
+                    field_obj = fields[candidate_name]
+                    confidence = field_obj.get("confidence")
+                    value = None
+
+                    for key in ["value_string", "value_date", "value_time", "content", "value_number"]:
+                        if field_obj.get(key) is not None:
+                            value = str(field_obj.get(key))
+                            break
+
+                    if value is not None and confidence is not None and confidence < FIELD_CONFIDENCE_THRESHOLD:
+                        all_field_flags.append({
+                            "field_name": field_name,
+                            "field_value": value,
+                            "confidence": confidence,
+                            "reason": "Low custom model confidence",
+                        })
+                    break
+
+        normalized["pages"].append(
+            {
+                "page_number": idx,
+                "page_type": doc.get("doc_type", "custom_page"),
+                "ocr_text": None,
+                "fields": {
+                    "batch_number": batch_number,
+                    "lot_number": lot_number,
+                    "date": date_value,
+                    "operator": operator,
+                    "material_name": material_name,
+                    "material_lot": material_lot,
+                    "quantity": quantity,
+                },
+                "confidence": doc.get("confidence"),
+                "review_flags": {
+                    "field_flags": all_field_flags,
+                },
+                "page_warnings": [
+                    f"{len(all_field_flags)} extracted field(s) flagged for review on page {idx}"
+                ] if all_field_flags else [],
+            }
+        )
+
+        for p in normalized["pages"]:
+            if not p["fields"]["batch_number"]:
+                p["fields"]["batch_number"] = normalized["document_batch_number"]
+            if not p["fields"]["lot_number"]:
+                p["fields"]["lot_number"] = normalized["document_lot_number"]
+            for warn in p.get("page_warnings", []):
+                normalized["validation_warnings"].append(warn)
+
+    return normalized
+
+
+def build_summary_dataframe(normalized: dict) -> pd.DataFrame:
+    rows = []
+    for p in normalized.get("pages", []):
+        row = {
+            "page_number": p.get("page_number"),
+            "page_type": p.get("page_type"),
+            "needs_review": bool(
+                p.get("review_flags", {}).get("field_flags")
+                or p.get("review_flags", {}).get("low_confidence_words")
+            ),
+        }
+        row.update(p.get("fields", {}))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+azure_extractor = load_azure_extractor()
+
+with st.sidebar:
+    st.header("Azure Settings")
+    endpoint_present = bool(os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"))
+    key_present = bool(os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY"))
+    st.write(f"Endpoint loaded: {'Yes' if endpoint_present else 'No'}")
+    st.write(f"Key loaded: {'Yes' if key_present else 'No'}")
+
+uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+
+pdf_bytes = None
+current_doc_hash = None
+
+if uploaded_file is not None:
+    pdf_bytes = uploaded_file.read()
+    current_doc_hash = hashlib.md5(pdf_bytes).hexdigest()
+
+    if (
+        st.session_state.document_hash is not None
+        and st.session_state.document_hash != current_doc_hash
+    ):
+        st.session_state.processed = False
+        st.session_state.raw_result = None
+        st.session_state.normalized_result = None
+        st.session_state.parsed_tables = []
+        st.session_state.summary_df = None
+
+    st.session_state.document_hash = current_doc_hash
+    st.session_state.document_name = uploaded_file.name
+
+with st.form("process_form"):
+    model_choice = st.selectbox(
+        "Choose Azure model",
+        ["prebuilt-layout", "prebuilt-read"],
+    )
+
+    pages_to_process = st.text_input(
+        "Pages to process (optional)",
+        placeholder="Example: 1-3 or 1,3,5",
+    )
+
+    custom_model_id = ""
+    if model_choice == "custom-model":
+        custom_model_id = st.text_input(
+            "Custom model ID",
+            value=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_CUSTOM_MODEL_ID", ""),
+        )
+
+    process_clicked = st.form_submit_button("Process Document")
+
+if uploaded_file is not None:
+    if process_clicked and pdf_bytes is not None:
+        with st.spinner("Sending document to Azure Document Intelligence..."):
+            try:
+                page_count = azure_extractor.get_pdf_page_count(pdf_bytes)
+
+                if model_choice == "prebuilt-read":
+                    if page_count > 50 and not pages_to_process:
+                        raw_result = azure_extractor.analyze_read_chunked(pdf_bytes, chunk_size=50)
+                    else:
+                        raw_result = azure_extractor.analyze_read(
+                            pdf_bytes,
+                            pages=pages_to_process or None,
+                        )
+                    normalized_result = normalize_prebuilt_result(raw_result)
+
+                elif model_choice == "prebuilt-layout":
+                    if page_count > 50 and not pages_to_process:
+                        raw_result = azure_extractor.analyze_layout_chunked(pdf_bytes, chunk_size=50)
+                    else:
+                        raw_result = azure_extractor.analyze_layout(
+                            pdf_bytes,
+                            pages=pages_to_process or None,
+                        )
+                    normalized_result = normalize_prebuilt_result(raw_result)
+
+                else:
+                    if page_count > 50 and not pages_to_process:
+                        raw_result = azure_extractor.analyze_custom_chunked(
+                            pdf_bytes,
+                            model_id=custom_model_id,
+                            chunk_size=50,
+                        )
+                    else:
+                        raw_result = azure_extractor.analyze_custom(
+                            pdf_bytes,
+                            model_id=custom_model_id,
+                            pages=pages_to_process or None,
+                        )
+                    normalized_result = normalize_custom_result(raw_result)
+
+                parsed_tables = []
+                if model_choice == "prebuilt-layout":
+                    parsed_tables = parse_all_azure_tables(raw_result)
+
+                st.success("Document processed successfully.")
+
+                df = build_summary_dataframe(normalized_result)
+
+                output_package = {
+                    "normalized_result": normalized_result,
+                    "parsed_tables": parsed_tables,
+                }
+
+                normalized_json = json.dumps(output_package, indent=2)
+                raw_json = json.dumps(raw_result, indent=2)
+
+                st.session_state.raw_result = raw_result
+                st.session_state.normalized_result = normalized_result
+                st.session_state.parsed_tables = parsed_tables
+                st.session_state.summary_df = df
+                st.session_state.document_name = uploaded_file.name
+                st.session_state.processed = True
+
+                # Record this file in the download log (avoid duplicate entries
+                # if the same document is re-processed within the same session).
+                log_entry = {
+                    "file_name": uploaded_file.name,
+                    "batch_number": normalized_result.get("document_batch_number"),
+                    "lot_number": normalized_result.get("document_lot_number"),
+                }
+                existing_names = [r["file_name"] for r in st.session_state.download_log]
+                if uploaded_file.name not in existing_names:
+                    st.session_state.download_log.append(log_entry)
+                else:
+                    # Update the existing entry in case the result changed
+                    for record in st.session_state.download_log:
+                        if record["file_name"] == uploaded_file.name:
+                            record.update(log_entry)
+                            break
+
+            except Exception as e:
+                st.error(f"Error processing document: {e}")
+
+if st.session_state.processed and st.session_state.normalized_result is not None:
+    raw_result = st.session_state.raw_result
+    normalized_result = st.session_state.normalized_result
+    parsed_tables = st.session_state.parsed_tables
+    df = st.session_state.summary_df
+
+    st.success(f"Showing saved results for: {st.session_state.document_name}")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        with st.expander("Show Normalized Batch Record Output"):
+            st.json(normalized_result)
+
+    with col2:
+        with st.expander("Show Raw Azure Output"):
+            st.json(raw_result)
+
+    if normalized_result.get("validation_warnings"):
+        with st.expander("Show Validation Warnings"):
+            for warning in normalized_result["validation_warnings"]:
+                st.warning(warning)
+
+    st.subheader("Summary Table")
+    st.dataframe(df, width='stretch')
+
+    flag_count = 0
+
+    with st.expander("Show Low-Confidence OCR Words"):
+        for page in normalized_result.get("pages", []):
+            page_number = page.get("page_number")
+            review_flags = page.get("review_flags", {})
+            field_flags = review_flags.get("field_flags", [])
+            low_conf_words = review_flags.get("low_confidence_words", [])
+
+            if field_flags or low_conf_words:
+                flag_count += 1
+                with st.expander(f"Page {page_number} review flags"):
+                    if field_flags:
+                        st.write("### Field Flags")
+                        st.json(field_flags)
+
+                    if low_conf_words:
+                        st.write("### Low-Confidence OCR Words")
+                        st.json(low_conf_words)
+
+    if flag_count == 0:
+        st.success("No confidence-based review flags found.")
+
+    if parsed_tables:
+        with st.expander("Show Parsed Azure Tables"):
+
+            for table in parsed_tables:
+                if 'table_index' in table:
+                    st.write(
+                        f"Raw Table {table['table_index']} "
+                        f"({table['row_count']} rows x {table['column_count']} columns)"
+                    )
+
+                    table_rows = table["rows"]
+                    if table_rows:
+                        table_df = pd.DataFrame(table_rows)
+                        st.dataframe(table_df, width='stretch')
+                    else:
+                        st.info("No parsed rows found for this table.")
+
+if st.session_state.processed and st.session_state.normalized_result is not None:
+    raw_result = st.session_state.raw_result
+    normalized_result = st.session_state.normalized_result
+    parsed_tables = st.session_state.parsed_tables
+    df = st.session_state.summary_df
+
+    output_package = {
+        "normalized_result": normalized_result,
+        "parsed_tables": parsed_tables,
+    }
+
+    normalized_json = json.dumps(output_package, indent=2)
+    raw_json = json.dumps(raw_result, indent=2)
+    csv_output = df.to_csv(index=False)
+
+    st.download_button(
+        label="Download Normalized JSON",
+        data=normalized_json,
+        file_name="batch_record_normalized.json",
+        mime="application/json",
+    )
+
+    st.download_button(
+        label="Download Raw Azure JSON",
+        data=raw_json,
+        file_name="batch_record_raw_azure.json",
+        mime="application/json",
+    )
+
+    st.download_button(
+        label="Download CSV Summary",
+        data=csv_output,
+        file_name="batch_record_summary.csv",
+        mime="text/csv",
+    )
+
+st.divider()
+st.subheader("Processed Files Log")
+
+if st.session_state.download_log:
+    log_df = pd.DataFrame(
+        st.session_state.download_log,
+        columns=["file_name", "batch_number", "lot_number"],
+    )
+
+    st.dataframe(log_df, width='stretch')
+
+    st.download_button(
+        label="Download Log as CSV",
+        data=log_df.to_csv(index=False),
+        file_name="processed_files_log.csv",
+        mime="text/csv",
+    )
+
+    if st.button("Clear Log"):
+        st.session_state.download_log = []
+        st.rerun()
+else:
+    st.info("No files processed yet.")
