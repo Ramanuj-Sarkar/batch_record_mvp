@@ -49,8 +49,6 @@ if "document_name" not in st.session_state:
 if "document_hash" not in st.session_state:
     st.session_state.document_hash = None
 
-if "download_log" not in st.session_state:
-    st.session_state.download_log = []
 
 st.set_page_config(page_title="Azure Batch Record Extraction MVP", layout="wide")
 
@@ -662,22 +660,29 @@ if uploaded_file is not None:
                 st.session_state.document_name = uploaded_file.name
                 st.session_state.processed = True
 
-                # Record this file in the download log (avoid duplicate entries
+                # Record this file in mvp3_dataframe.csv (avoid duplicate entries
                 # if the same document is re-processed within the same session).
                 log_entry = {
                     "file_name": uploaded_file.name,
                     "batch_number": normalized_result.get("document_batch_number"),
                     "lot_number": normalized_result.get("document_lot_number"),
                 }
-                existing_names = [r["file_name"] for r in st.session_state.download_log]
-                if uploaded_file.name not in existing_names:
-                    st.session_state.download_log.append(log_entry)
+                log_csv_path = "mvp3_dataframe.csv"
+                if os.path.exists(log_csv_path):
+                    log_df = pd.read_csv(log_csv_path)
+                    if uploaded_file.name in log_df["file_name"].values:
+                        log_df.loc[log_df["file_name"] == uploaded_file.name, ["batch_number", "lot_number"]] = (
+                            log_entry["batch_number"],
+                            log_entry["lot_number"],
+                        )
+                    else:
+                        log_df = pd.concat(
+                            [log_df, pd.DataFrame([log_entry])],
+                            ignore_index=True,
+                        )
                 else:
-                    # Update the existing entry in case the result changed
-                    for record in st.session_state.download_log:
-                        if record["file_name"] == uploaded_file.name:
-                            record.update(log_entry)
-                            break
+                    log_df = pd.DataFrame([log_entry], columns=["file_name", "batch_number", "lot_number"])
+                log_df.to_csv(log_csv_path, index=False)
 
             except Exception as e:
                 st.error(f"Error processing document: {e}")
@@ -787,23 +792,22 @@ if st.session_state.processed and st.session_state.normalized_result is not None
 st.divider()
 st.subheader("Processed Files Log")
 
-if st.session_state.download_log:
-    log_df = pd.DataFrame(
-        st.session_state.download_log,
-        columns=["file_name", "batch_number", "lot_number"],
-    )
+if os.path.exists("mvp3_dataframe.csv"):
+    log_df = pd.read_csv("mvp3_dataframe.csv")
+    if not log_df.empty:
+        st.dataframe(log_df, width='stretch')
 
-    st.dataframe(log_df, width='stretch')
+        st.download_button(
+            label="Download Log as CSV",
+            data=log_df.to_csv(index=False),
+            file_name="mvp3_dataframe.csv",
+            mime="text/csv",
+        )
 
-    st.download_button(
-        label="Download Log as CSV",
-        data=log_df.to_csv(index=False),
-        file_name="processed_files_log.csv",
-        mime="text/csv",
-    )
-
-    if st.button("Clear Log"):
-        st.session_state.download_log = []
-        st.rerun()
+        if st.button("Clear Log"):
+            os.remove("mvp3_dataframe.csv")
+            st.rerun()
+    else:
+        st.info("No files processed yet.")
 else:
     st.info("No files processed yet.")
