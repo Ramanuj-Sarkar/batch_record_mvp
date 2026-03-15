@@ -142,21 +142,6 @@ def recover_cell_text_from_words(cell: dict, pages: list[dict]) -> str:
     return " ".join(w for w in recovered_words if w).strip()
 
 
-def convert_table_to_events(rows: list[dict], pagenum: int = 0) -> list[dict]:
-    events = []
-
-    for r in rows:
-        events.append({
-            "event_type": "process_log",
-            "time": r.get("Time"),
-            "temperature": r.get("Temp"),
-            "operator": r.get("Operator"),
-            "page": pagenum
-        })
-
-    return events
-
-
 def parse_azure_table(t: dict, pages: list[dict]) -> list[dict]:
     """
     Convert one Azure table object into a list of row dictionaries.
@@ -166,7 +151,6 @@ def parse_azure_table(t: dict, pages: list[dict]) -> list[dict]:
     inside the cell bounding box.
     Assumes row 0 contains headers.
     """
-    headers = {}
     rows = {}
 
     for cell in t.get("cells", []):
@@ -178,16 +162,15 @@ def parse_azure_table(t: dict, pages: list[dict]) -> list[dict]:
         if not text:
             text = recover_cell_text_from_words(cell, pages)
 
-        if r == 0:
-            headers[c] = text if text else f"col_{c}"
-        else:
-            if r not in rows:
-                rows[r] = {}
+        if r not in rows:
+            rows[r] = {}
 
-            column_name = headers.get(c, f"col_{c}")
-            rows[r][column_name] = text
+        column_name = c
+        rows[r][column_name] = text
 
-    return list(rows.values())
+    pre_table = list(rows.values())
+
+    return pre_table
 
 
 def parse_all_azure_tables(rr: dict) -> list[dict]:
@@ -206,11 +189,6 @@ def parse_all_azure_tables(rr: dict) -> list[dict]:
             "column_count": t.get("column_count"),
             "rows": parsed_rows,
         })
-
-        if 'Temp' in parsed_rows[0]:
-            events = convert_table_to_events(parsed_rows)
-            for event in events:
-                parsed_t.append(event)
 
     return parsed_t
 
@@ -737,11 +715,9 @@ if st.session_state.processed and st.session_state.normalized_result is not None
         with st.expander("Show Parsed Azure Tables"):
 
             for table in parsed_tables:
-                if 'event_type' in table:
-                    continue
-                elif 'table_index' in table:
+                if 'table_index' in table:
                     st.write(
-                        f"Table {table['table_index']} "
+                        f"Raw Table {table['table_index']} "
                         f"({table['row_count']} rows x {table['column_count']} columns)"
                     )
 
@@ -751,6 +727,12 @@ if st.session_state.processed and st.session_state.normalized_result is not None
                         st.dataframe(table_df, width='stretch')
                     else:
                         st.info("No parsed rows found for this table.")
+
+if st.session_state.processed and st.session_state.normalized_result is not None:
+    raw_result = st.session_state.raw_result
+    normalized_result = st.session_state.normalized_result
+    parsed_tables = st.session_state.parsed_tables
+    df = st.session_state.summary_df
 
     output_package = {
         "normalized_result": normalized_result,
