@@ -1,14 +1,15 @@
 """
-MVP 2: Batch Record Extraction with Confidence
+MVP 3: Batch Record Extraction with Specificity
 
 This version improves upon the previous MVP by adding
-confidence data which focuses on possible issues,
-methods to fill in data missing from specific pages,
-and a different format for tables which incorporates data better.
+a table which shows all of the files which have been added using upserts
+a CSV which acts as an external source of memory
+an option to very accurately obtain data from a specific file structure
+tables which display this specific data, not using upsets
 
 Goal:
-Enhance previous MVP by adding confidence data
-and ability to incorporate AI tools when appropriate.
+Enhance previous MVP by adding
+different ways of obtaining and displaying information
 """
 import json
 import os
@@ -48,6 +49,32 @@ if "document_name" not in st.session_state:
 
 if "document_hash" not in st.session_state:
     st.session_state.document_hash = None
+
+if "product_details" not in st.session_state:
+    st.session_state.product_details = {
+        'tablet_number': [],
+        'batch_number': [],
+        'manufacturing_date': [],
+        'expiry_date': []
+    }
+
+if "document_details" not in st.session_state:
+    st.session_state.document_details = {
+        'prepare_sign': [],
+        'prepare_sign_date': [],
+        'approve_sign': [],
+        'approve_sign_date': []
+    }
+
+if "preparer_details" not in st.session_state:
+    st.session_state.preparer_details = {
+        'name': []
+    }
+
+if "approver_details" not in st.session_state:
+    st.session_state.approver_details = {
+        'name': []
+    }
 
 
 st.set_page_config(page_title="Azure Batch Record Extraction MVP", layout="wide")
@@ -297,6 +324,190 @@ def build_field_review_flags(fields: dict, p: dict, threshold: float = FIELD_CON
     return flags
 
 
+def normalize_simpletest(result: dict) -> dict:
+    normalized = {
+        "pages": [],
+        "validation_warnings": [],
+    }
+
+    pages = result.get("pages", [])
+    if len(pages) != 1:
+        raise ValueError('"SimpleTest" is not the correct document setting.\n'
+                         'Please choose another setting.')
+
+    p = pages[0]
+    # page_layout = [_ for _ in p.get("lines", [])]
+    page_lines = [line["content"] for line in p.get("lines", [])]
+    page_text = "\n".join(page_lines)
+
+    tables = result.get("tables", [])
+
+    if len(tables) != 2:
+        raise ValueError('"SimpleTest" is not the correct document setting.\n'
+                         'Please choose another setting.')
+
+    product_details = {
+        'tablet_number': None,
+        'batch_number': None,
+        'manufacturing_date': None,
+        'expiry_date': None
+    }
+
+    document_details = {
+        'prepare_sign': None,
+        'prepare_sign_date': None,
+        'approve_sign': None,
+        'approve_sign_date': None
+    }
+
+    preparer_details = {
+        'name': None
+    }
+
+    approver_details = {
+        'name': None
+    }
+
+    first_table, second_table = tables[0], tables[1]
+
+    correct_tables = (first_table['row_count'] == 3 and
+                      first_table['column_count'] == 4 and
+                      second_table['row_count'] == 2 and
+                      second_table['column_count'] == 3)
+
+    if not correct_tables:
+        raise ValueError('"SimpleTest" is not the correct document setting.\n'
+                         'Please choose another setting.')
+
+    for cell in first_table['cells']:
+        match (cell['row_index'], cell['column_index']):
+            case (1, 1):
+                content = re.search(r'(\w+) Production Manager', cell['content'])
+                if content:
+                    success = content.group(1).strip()
+                    preparer_details['name'] = success
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing production manager name."
+                    )
+            case (1, 2):
+                content = cell['content']
+                if content:
+                    document_details['prepare_sign'] = content
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing production manager signature."
+                    )
+            case (1, 3):
+                content = cell['content']
+                if content:
+                    document_details['prepare_sign_date'] = content
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing date of production manager signature."
+                    )
+            case (2, 1):
+                content = re.search(r'(\w+) QA Manager', cell['content'])
+                if content:
+                    success = content.group(1).strip()
+                    approver_details['name'] = success
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing QA manager name."
+                    )
+            case (2, 2):
+                content = cell['content']
+                if content:
+                    document_details['approve_sign'] = content
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing QA manager signature."
+                    )
+            case (2, 3):
+                content = cell['content']
+                if content:
+                    document_details['approve_sign_date'] = content
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing date of production manager signature."
+                    )
+
+    tablet_there = re.search(r'\nTablets No:\n(\d+)\n', page_text)
+
+    if tablet_there:
+        tablet_number = tablet_there.group(1).strip()
+        product_details['tablet_number'] = tablet_number
+    else:
+        normalized['validation_warnings'].append(
+            "May be missing tablet number."
+        )
+
+    for cell in second_table['cells']:
+        match (cell['row_index'], cell['column_index']):
+            case (1, 0):
+                content = cell['content']
+                if content:
+                    product_details['batch_number'] = content
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing batch number."
+                    )
+            case(1, 1):
+                content = cell['content']
+                if content:
+                    product_details['manufacturing_date'] = content
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing manufacturing date."
+                    )
+            case (1, 2):
+                content = cell['content']
+                if content:
+                    product_details['expiry_date'] = content
+                else:
+                    normalized['validation_warnings'].append(
+                        "May be missing expiry date."
+                    )
+
+    normalized["product_details"] = product_details
+    normalized["document_details"] = document_details
+    normalized["preparer_details"] = preparer_details
+    normalized["approver_details"] = approver_details
+
+    pagenum = p['page_number']
+    page_type = 'header page'
+
+    fields = {}
+
+    low_confidence_words = get_low_confidence_words(p)
+    field_review_flags = build_field_review_flags(fields, p)
+
+    if low_confidence_words:
+        normalized['validation_warnings'].append(
+            f"{len(low_confidence_words)} low-confidence OCR word(s) detected"
+        )
+
+    if field_review_flags:
+        normalized['validation_warnings'].append(
+            f"{len(field_review_flags)} extracted field(s) flagged for review"
+        )
+
+    normalized["pages"].append(
+        {
+            'page_number': pagenum,
+            'page_type': page_type,
+            "ocr_text": page_text,
+            "fields": fields,
+            "review_flags": {
+                "low_confidence_words": low_confidence_words[:MAX_LOW_CONFIDENCE_WORDS_TO_SHOW],
+                "field_flags": field_review_flags,
+            },
+        }
+    )
+
+    return normalized
+
+
 def normalize_prebuilt_result(result: dict) -> dict:
     """
     Normalize Azure prebuilt-read or prebuilt-layout output into a simple schema.
@@ -313,14 +524,17 @@ def normalize_prebuilt_result(result: dict) -> dict:
 
     for p in result.get("pages", []):
         pagenum = p["page_number"]
-        page_text = "\n".join(line["content"] for line in p.get("lines", []))
+        # page_layout = [_ for _ in p.get("lines", [])]
+        page_lines = [line["content"] for line in p.get("lines", [])]
+        page_text = "\n".join(page_lines)
+
         page_type = classify_page(page_text)
 
         batch_number = extract_with_patterns(
             page_text,
             [
                 r"Batch\s*Number[:\-]?\s*([A-Za-z0-9\-\/]+)",
-                r"Batch\s*Record\s*:\n*\s*([A-Za-z0-9\-\/]+)"
+                r"Batch\s*Record\s*:\n*\s*([A-Za-z0-9\-\/]+)",
                 r"Batch\s*No[:\-]?\s*([A-Za-z0-9\-\/]+)",
                 r"BMR\s*No\s*.:\s*([A-Za-z0-9\-\/]+)"
             ],
@@ -418,6 +632,13 @@ def normalize_prebuilt_result(result: dict) -> dict:
             normalized["validation_warnings"].append(warn)
 
     return normalized
+
+
+def normalize_prebuilt_with_document(rr: dict, doc_choice: str) -> dict:
+    if doc_choice == "SimpleTest":
+        return normalize_simpletest(rr)
+    else:
+        return normalize_prebuilt_result(rr)
 
 
 def normalize_custom_result(result: dict) -> dict:
@@ -529,6 +750,10 @@ def normalize_custom_result(result: dict) -> dict:
     return normalized
 
 
+def normalize_custom_with_document(rr: dict, doc_choice: str) -> dict:
+    return normalize_custom_result(rr)  # may change later
+
+
 def build_summary_dataframe(normalized: dict) -> pd.DataFrame:
     rows = []
     for p in normalized.get("pages", []):
@@ -563,6 +788,7 @@ if uploaded_file is not None:
     pdf_bytes = uploaded_file.read()
     current_doc_hash = hashlib.md5(pdf_bytes).hexdigest()
 
+    # checks if a different document has been uploaded
     if (
         st.session_state.document_hash is not None
         and st.session_state.document_hash != current_doc_hash
@@ -580,6 +806,11 @@ with st.form("process_form"):
     model_choice = st.selectbox(
         "Choose Azure model",
         ["prebuilt-layout", "prebuilt-read"],
+    )
+
+    document_choice = st.selectbox(
+        "Choose specified document type",
+        ["N/A", "SimpleTest"],
     )
 
     pages_to_process = st.text_input(
@@ -610,7 +841,7 @@ if uploaded_file is not None:
                             pdf_bytes,
                             pages=pages_to_process or None,
                         )
-                    normalized_result = normalize_prebuilt_result(raw_result)
+                    normalized_result = normalize_prebuilt_with_document(raw_result, document_choice)
 
                 elif model_choice == "prebuilt-layout":
                     if page_count > 50 and not pages_to_process:
@@ -620,7 +851,7 @@ if uploaded_file is not None:
                             pdf_bytes,
                             pages=pages_to_process or None,
                         )
-                    normalized_result = normalize_prebuilt_result(raw_result)
+                    normalized_result = normalize_prebuilt_with_document(raw_result, document_choice)
 
                 else:
                     if page_count > 50 and not pages_to_process:
@@ -653,6 +884,16 @@ if uploaded_file is not None:
                 normalized_json = json.dumps(output_package, indent=2)
                 raw_json = json.dumps(raw_result, indent=2)
 
+                if 'product_details' in normalized_result:
+                    for x in normalized_result['product_details']:
+                        st.session_state.product_details[x].append(normalized_result['product_details'][x])
+                    for x in normalized_result['document_details']:
+                        st.session_state.document_details[x].append(normalized_result['document_details'][x])
+                    for x in normalized_result['preparer_details']:
+                        st.session_state.preparer_details[x].append(normalized_result['preparer_details'][x])
+                    for x in normalized_result['approver_details']:
+                        st.session_state.approver_details[x].append(normalized_result['approver_details'][x])
+
                 st.session_state.raw_result = raw_result
                 st.session_state.normalized_result = normalized_result
                 st.session_state.parsed_tables = parsed_tables
@@ -667,6 +908,7 @@ if uploaded_file is not None:
                     "batch_number": normalized_result.get("document_batch_number"),
                     "lot_number": normalized_result.get("document_lot_number"),
                 }
+
                 log_csv_path = "mvp3_dataframe.csv"
                 if os.path.exists(log_csv_path):
                     log_df = pd.read_csv(log_csv_path)
@@ -710,9 +952,6 @@ if st.session_state.processed and st.session_state.normalized_result is not None
             for warning in normalized_result["validation_warnings"]:
                 st.warning(warning)
 
-    st.subheader("Summary Table")
-    st.dataframe(df, width='stretch')
-
     flag_count = 0
 
     with st.expander("Show Low-Confidence OCR Words"):
@@ -736,7 +975,24 @@ if st.session_state.processed and st.session_state.normalized_result is not None
     if flag_count == 0:
         st.success("No confidence-based review flags found.")
 
-    if parsed_tables:
+    if document_choice == 'SimpleTest':
+        st.write("Product Details:")
+        details_df1 = pd.DataFrame(st.session_state.product_details)
+        edited_df1 = st.data_editor(details_df1, width='stretch')
+        st.session_state.product_details = edited_df1.to_dict(orient="list")
+        st.write("Document Details:")
+        details_df2 = pd.DataFrame(st.session_state.document_details)
+        edited_df2 = st.data_editor(details_df2, width='stretch')
+        st.session_state.document_details = edited_df2.to_dict(orient="list")
+        st.write("Preparer Details:")
+        details_df3 = pd.DataFrame(st.session_state.preparer_details)
+        edited_df3 = st.data_editor(details_df3, width='stretch')
+        st.session_state.preparer_details = edited_df3.to_dict(orient="list")
+        st.write("Approver Details:")
+        details_df4 = pd.DataFrame(st.session_state.approver_details)
+        edited_df4 = st.data_editor(details_df4, width='stretch')
+        st.session_state.approver_details = edited_df4.to_dict(orient="list")
+    elif parsed_tables:
         with st.expander("Show Parsed Azure Tables"):
 
             for table in parsed_tables:
