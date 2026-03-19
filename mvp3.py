@@ -2,10 +2,10 @@
 MVP 3: Batch Record Extraction with Specificity
 
 This version improves upon the previous MVP by adding
-a table which shows all of the files which have been added using upserts
+a table which shows all the files which have been added using upserts
 a CSV which acts as an external source of memory
 an option to very accurately obtain data from a specific file structure
-tables which display this specific data, not using upsets
+tables which display this specific data, not using upserts
 
 Goal:
 Enhance previous MVP by adding
@@ -635,6 +635,9 @@ def normalize_prebuilt_result(result: dict) -> dict:
 
 
 def normalize_prebuilt_with_document(rr: dict, doc_choice: str) -> dict:
+    """
+    Redirect Azure prebuilt model normalization to the proper channel.
+    """
     if doc_choice == "SimpleTest":
         return normalize_simpletest(rr)
     else:
@@ -751,6 +754,9 @@ def normalize_custom_result(result: dict) -> dict:
 
 
 def normalize_custom_with_document(rr: dict, doc_choice: str) -> dict:
+    """
+    Redirect Azure custom model normalization to the proper channel.
+    """
     return normalize_custom_result(rr)  # may change later
 
 
@@ -768,6 +774,65 @@ def build_summary_dataframe(normalized: dict) -> pd.DataFrame:
         row.update(p.get("fields", {}))
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def generate_postgresql_from_dataframes(dataframes: dict[str, pd.DataFrame]) -> str:
+    sql_parts = []
+
+    for table_name, df in dataframes.items():
+        # --- CREATE TABLE ---
+        col_definitions = []
+        for col in df.columns:
+            dtype = df[col].dtype
+            if pd.api.types.is_integer_dtype(dtype):
+                sql_type = "INTEGER"
+            elif pd.api.types.is_float_dtype(dtype):
+                sql_type = "NUMERIC"
+            elif pd.api.types.is_bool_dtype(dtype):
+                sql_type = "BOOLEAN"
+            elif pd.api.types.is_datetime64_any_dtype(dtype):
+                sql_type = "TIMESTAMP"
+            else:
+                sql_type = "TEXT"
+
+            col_definitions.append(f'    "{col}" {sql_type}')
+
+        create_stmt = (
+            f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n'
+            + ",\n".join(col_definitions)
+            + "\n);"
+        )
+        sql_parts.append(create_stmt)
+
+        # --- INSERT ROWS ---
+        if not df.empty:
+            col_names = ", ".join(f'"{col}"' for col in df.columns)
+
+            row_values = []
+            for _, row in df.iterrows():
+                formatted = []
+                for col in df.columns:
+                    val = row[col]
+                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                        formatted.append("NULL")
+                    elif isinstance(val, bool):
+                        formatted.append("TRUE" if val else "FALSE")
+                    elif isinstance(val, (int, float)):
+                        formatted.append(str(val))
+                    else:
+                        escaped = str(val).replace("'", "''")
+                        formatted.append(f"'{escaped}'")
+
+                row_values.append("    (" + ", ".join(formatted) + ")")
+
+            insert_stmt = (
+                f'INSERT INTO "{table_name}" ({col_names}) VALUES\n'
+                + ",\n".join(row_values)
+                + ";"
+            )
+            sql_parts.append(insert_stmt)
+
+    return "\n\n".join(sql_parts)
 
 
 azure_extractor = load_azure_extractor()
@@ -934,8 +999,9 @@ if st.session_state.processed and st.session_state.normalized_result is not None
     normalized_result = st.session_state.normalized_result
     parsed_tables = st.session_state.parsed_tables
     df = st.session_state.summary_df
+    document_name = st.session_state.document_name
 
-    st.success(f"Showing saved results for: {st.session_state.document_name}")
+    st.success(f"Showing saved results for: {document_name}")
 
     col1, col2 = st.columns(2)
 
@@ -976,22 +1042,39 @@ if st.session_state.processed and st.session_state.normalized_result is not None
         st.success("No confidence-based review flags found.")
 
     if document_choice == 'SimpleTest':
-        st.write("Product Details:")
-        details_df1 = pd.DataFrame(st.session_state.product_details)
-        edited_df1 = st.data_editor(details_df1, width='stretch')
-        st.session_state.product_details = edited_df1.to_dict(orient="list")
-        st.write("Document Details:")
-        details_df2 = pd.DataFrame(st.session_state.document_details)
-        edited_df2 = st.data_editor(details_df2, width='stretch')
-        st.session_state.document_details = edited_df2.to_dict(orient="list")
-        st.write("Preparer Details:")
-        details_df3 = pd.DataFrame(st.session_state.preparer_details)
-        edited_df3 = st.data_editor(details_df3, width='stretch')
-        st.session_state.preparer_details = edited_df3.to_dict(orient="list")
-        st.write("Approver Details:")
-        details_df4 = pd.DataFrame(st.session_state.approver_details)
-        edited_df4 = st.data_editor(details_df4, width='stretch')
-        st.session_state.approver_details = edited_df4.to_dict(orient="list")
+        with st.expander("Show SQL Tables"):
+            st.write("Product Details:")
+            details_df1 = pd.DataFrame(st.session_state.product_details)
+            edited_df1 = st.data_editor(details_df1, width='stretch')
+            st.session_state.product_details = edited_df1.to_dict(orient="list")
+            st.write("Document Details:")
+            details_df2 = pd.DataFrame(st.session_state.document_details)
+            edited_df2 = st.data_editor(details_df2, width='stretch')
+            st.session_state.document_details = edited_df2.to_dict(orient="list")
+            st.write("Preparer Details:")
+            details_df3 = pd.DataFrame(st.session_state.preparer_details)
+            edited_df3 = st.data_editor(details_df3, width='stretch')
+            st.session_state.preparer_details = edited_df3.to_dict(orient="list")
+            st.write("Approver Details:")
+            details_df4 = pd.DataFrame(st.session_state.approver_details)
+            edited_df4 = st.data_editor(details_df4, width='stretch')
+            st.session_state.approver_details = edited_df4.to_dict(orient="list")
+            all_dataframes = {
+                'product_details': edited_df1,
+                'document_details': edited_df2,
+                'preparer_details': edited_df3,
+                'approver_details': edited_df4
+            }
+            sql_creation_file = generate_postgresql_from_dataframes(all_dataframes)
+
+            st.download_button(
+                label="Download PostgreSQL",
+                data=sql_creation_file,
+                file_name=f"{document_name}_postgre.sql",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
     elif parsed_tables:
         with st.expander("Show Parsed Azure Tables"):
 
@@ -1014,6 +1097,7 @@ if st.session_state.processed and st.session_state.normalized_result is not None
     normalized_result = st.session_state.normalized_result
     parsed_tables = st.session_state.parsed_tables
     df = st.session_state.summary_df
+    document_name = st.session_state.document_name
 
     output_package = {
         "normalized_result": normalized_result,
@@ -1027,21 +1111,21 @@ if st.session_state.processed and st.session_state.normalized_result is not None
     st.download_button(
         label="Download Normalized JSON",
         data=normalized_json,
-        file_name="batch_record_normalized.json",
+        file_name=f"{document_name}_normalized.json",
         mime="application/json",
     )
 
     st.download_button(
         label="Download Raw Azure JSON",
         data=raw_json,
-        file_name="batch_record_raw_azure.json",
+        file_name=f"{document_name}_raw_azure.json",
         mime="application/json",
     )
 
     st.download_button(
         label="Download CSV Summary",
         data=csv_output,
-        file_name="batch_record_summary.csv",
+        file_name=f"{document_name}_summary.csv",
         mime="text/csv",
     )
 
