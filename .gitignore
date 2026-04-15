@@ -1,2 +1,4 @@
 .env
 mvp3_dataframe.csv
+.DS_Store
+.idea/
